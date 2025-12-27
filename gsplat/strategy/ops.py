@@ -89,6 +89,184 @@ def _update_param_with_optimizer(
             optimizer.state[new_param] = param_state
 
 
+def sample_split_positions_with_poisson_vectorized(
+    parent_means: Tensor,      # [N, 3]
+    parent_scales: Tensor,     # [N, 3]
+    parent_rotmats: Tensor,    # [N, 3, 3]
+    all_means: Tensor,         # [M, 3]
+    min_dist_factor: float = 1.0,
+    k_neighbours: int = 16,
+    n_candidates: int = 32,
+    batch_size: int = 128,
+) -> Tuple[Tensor, Tensor]:
+    """
+    Batched + vectorized Poisson disk sampling for split positions.
+    """
+    device = parent_means.device
+    N = len(parent_means)
+    M = len(all_means)
+    
+    child1_positions = torch.zeros_like(parent_means)  # [N, 3]
+    child2_positions = torch.zeros_like(parent_means)  # [N, 3]
+    
+    # Process in batches
+    for batch_start in range(0, N, batch_size):
+        batch_end = min(batch_start + batch_size, N)
+        batch_N = batch_end - batch_start
+        
+        # Get batch data
+        batch_parent_means = parent_means[batch_start:batch_end]      # [batch_N, 3]
+        batch_parent_scales = parent_scales[batch_start:batch_end]    # [batch_N, 3]
+        batch_parent_rotmats = parent_rotmats[batch_start:batch_end]  # [batch_N, 3, 3]
+        
+        parent_scale_avg = batch_parent_scales.mean(dim=1)  # [batch_N]
+        min_dists = min_dist_factor * parent_scale_avg  # [batch_N]
+        
+        all_dists = torch.cdist(batch_parent_means, all_means)  # [batch_N, M]
+        k = min(k_neighbours + 1, M)
+        _, neighbour_indices = torch.topk(all_dists, k=k, largest=False, dim=1)  # [batch_N, k]
+        
+        # Remove self
+        neighbour_indices = neighbour_indices[:, 1:]  # [batch_N, k_neighbours]
+        neighbour_positions = all_means[neighbour_indices]  # [batch_N, k_neighbours, 3]
+        
+        # === CHILD 1 ===
+        directions = torch.randn(batch_N, n_candidates, 3, device=device)
+        directions = directions / torch.norm(directions, dim=2, keepdim=True)
+        directions = torch.einsum('nci,nji->ncj', directions, batch_parent_rotmats)
+        radii = min_dists.view(batch_N, 1, 1) * (1.0 + torch.rand(batch_N, n_candidates, 1, device=device) * 0.5)
+        candidates1 = batch_parent_means.unsqueeze(1) + directions * radii  # [batch_N, n_candidates, 3]
+        
+        # Check constraints
+        candidate_expanded = candidates1.unsqueeze(2)  # [batch_N, n_candidates, 1, 3]
+        neighbour_expanded = neighbour_positions.unsqueeze(1)  # [batch_N, 1, k_neighbours, 3]
+        dists_to_neighbours = torch.norm(candidate_expanded - neighbour_expanded, dim=3)
+        min_neighbour_dists = dists_to_neighbours.min(dim=2).values  # [batch_N, n_candidates]
+        
+        best_candidate_idx = min_neighbour_dists.argmax(dim=1)  # [batch_N]
+        batch_child1 = candidates1[torch.arange(batch_N, device=device), best_candidate_idx]
+        best_dists = min_neighbour_dists[torch.arange(batch_N, device=device), best_candidate_idx]
+        failed_mask = best_dists < min_dists
+        
+        # Fallback for child1
+        if failed_mask.any():
+            noise = torch.randn(failed_mask.sum(), 3, device=device)
+            fallback_positions = (batch_parent_means[failed_mask] + 
+                                 torch.einsum('nij,nj->ni', 
+                                            batch_parent_rotmats[failed_mask], 
+                                            batch_parent_scales[failed_mask] * noise))
+            batch_child1[failed_mask] = fallback_positions
+        
+        # === CHILD 2 ===
+        directions2 = torch.randn(batch_N, n_candidates, 3, device=device)
+        directions2 = directions2 / torch.norm(directions2, dim=2, keepdim=True)
+        directions2 = torch.einsum('nci,nji->ncj', directions2, batch_parent_rotmats)
+        radii2 = min_dists.view(batch_N, 1, 1) * (1.0 + torch.rand(batch_N, n_candidates, 1, device=device) * 0.5)
+        candidates2 = batch_parent_means.unsqueeze(1) + directions2 * radii2  # [batch_N, n_candidates, 3]
+        
+        candidates_expanded2 = candidates2.unsqueeze(2)
+        dists_to_neighbours2 = torch.norm(candidates_expanded2 - neighbour_expanded, dim=3)
+        min_neighbour_dists2 = dists_to_neighbours2.min(dim=2).values  # [batch_N, n_candidates]
+        
+        dists_to_child1 = torch.norm(candidates2 - batch_child1.unsqueeze(1), dim=2)
+        
+        # Combined constraint
+        min_combined_dists = torch.minimum(min_neighbour_dists2, dists_to_child1)
+        
+        # Select best candidate
+        best_candidate_idx2 = min_combined_dists.argmax(dim=1)
+        batch_child2 = candidates2[torch.arange(batch_N, device=device), best_candidate_idx2]
+        
+        # Fallback for child2
+        best_combined = min_combined_dists[torch.arange(batch_N, device=device), best_candidate_idx2]
+        failed_mask2 = best_combined < min_dists
+        if failed_mask2.any():
+            noise2 = torch.randn(failed_mask2.sum(), 3, device=device)
+            fallback_positions2 = (batch_parent_means[failed_mask2] - 
+                                  torch.einsum('nij,nj->ni',
+                                             batch_parent_rotmats[failed_mask2],
+                                             batch_parent_scales[failed_mask2] * noise2))
+            batch_child2[failed_mask2] = fallback_positions2
+        
+        # Store batch results
+        child1_positions[batch_start:batch_end] = batch_child1
+        child2_positions[batch_start:batch_end] = batch_child2
+    
+    return child1_positions, child2_positions
+
+def sample_duplicate_blue_noise_positions_vectorized(
+    parent_means: Tensor,  # [N, 3]
+    all_means: Tensor,     # [M, 3] all Gaussian positions
+    parent_scales: Tensor, # [N]
+    min_dist_factor: float = 1.0,
+    k_neighbours: int = 10,
+    n_candidates: int = 32,
+    batch_size: int = 128,
+) -> Tensor:
+    """
+    Batched + vectorized poisson disc sampling for duplicating gaussians.
+    """
+    device = parent_means.device
+    N = len(parent_means)
+    M = len(all_means)
+    
+    new_positions = torch.zeros_like(parent_means)  # [N, 3]
+    
+    # Process in batches
+    for batch_start in range(0, N, batch_size):
+        batch_end = min(batch_start + batch_size, N)
+        batch_N = batch_end - batch_start
+        
+        # Get batch data
+        batch_parent_means = parent_means[batch_start:batch_end]
+        batch_parent_scales = parent_scales[batch_start:batch_end]
+        
+        min_dists = min_dist_factor * batch_parent_scales  # [batch_N]
+        all_dists = torch.cdist(batch_parent_means, all_means)  # [batch_N, M]
+        
+        k = min(k_neighbours + 1, M)
+        _, neighbour_indices = torch.topk(all_dists, k=k, largest=False, dim=1)
+        neighbour_indices = neighbour_indices[:, 1:]  # [batch_N, k_neighbours]
+        neighbour_positions = all_means[neighbour_indices]  # [batch_N, k_neighbours, 3]
+        
+        # Generate candidates
+        directions = torch.randn(batch_N, n_candidates, 3, device=device)
+        directions = directions / torch.norm(directions, dim=2, keepdim=True)
+        distances = torch.rand(batch_N, n_candidates, 1, device=device) * min_dists.view(batch_N, 1, 1) * 2.0
+        candidates = batch_parent_means.unsqueeze(1) + directions * distances
+        
+        # Check constraints
+        candidate_expanded = candidates.unsqueeze(2)
+        neighbour_expanded = neighbour_positions.unsqueeze(1)
+        dists_to_neighbors = torch.norm(candidate_expanded - neighbour_expanded, dim=3)
+        is_valid = (dists_to_neighbors >= min_dists.view(batch_N, 1, 1)).all(dim=2)  # [batch_N, n_candidates]
+        
+        # === VECTORIZED SELECTION (NO LOOP) ===
+        # Find first valid candidate index for each parent
+        candidate_indices = torch.arange(n_candidates, device=device).unsqueeze(0).expand(batch_N, -1)
+        # Mask invalid with large number
+        candidate_indices = torch.where(is_valid, candidate_indices, n_candidates)
+        
+        # Get first valid index
+        first_valid_idx = candidate_indices.min(dim=1).values  # [batch_N]
+        has_valid = (first_valid_idx < n_candidates)  # [batch_N]
+        
+        # Gather selected candidates
+        first_valid_idx = first_valid_idx.clamp(max=n_candidates - 1)
+        batch_new_positions = candidates[torch.arange(batch_N, device=device), first_valid_idx]
+        
+        # Fallback to parent position where no valid candidate found
+        batch_new_positions = torch.where(
+            has_valid.unsqueeze(1), 
+            batch_new_positions, 
+            batch_parent_means
+        )
+        
+        new_positions[batch_start:batch_end] = batch_new_positions
+    
+    return new_positions
+
+
 def sample_duplicate_blue_noise_positions(
     parent_means: Tensor,  # [N, 3]
     all_means: Tensor,     # [M, 3] all Gaussian positions
@@ -139,13 +317,15 @@ def sample_duplicate_blue_noise_positions(
     return new_positions
 
 
+
+
 def sample_split_positions_with_poisson(
     parent_means: Tensor,      # [N, 3]
     parent_scales: Tensor,     # [N, 3]
     parent_rotmats: Tensor,    # [N, 3, 3]
     all_means: Tensor,         # [M, 3]
     min_dist_factor: float = 1.0,
-    k_neighbours: int = 20,
+    k_neighbours: int = 16,
     max_attempts: int = 30,
 ) -> Tuple[Tensor, Tensor]:
     """
@@ -230,7 +410,7 @@ def duplicate_with_poisson(
     state: Dict[str, Tensor],
     mask: Tensor,
     min_dist_factor: float = 1.0,
-    k_neighbours: int = 20,
+    k_neighbours: int = 16,
     max_attempts: int = 30,
 ):
     """Inplace duplicate the Gaussian with the given mask. Uses poisson disc
@@ -248,13 +428,14 @@ def duplicate_with_poisson(
     parent_means = params["means"][sel]
     parent_scales = torch.exp(params["scales"][sel]).mean(dim=-1)
     all_means = params["means"]
-    new_means = sample_duplicate_blue_noise_positions(
+    new_means = sample_duplicate_blue_noise_positions_vectorized(
         parent_means = parent_means,
         all_means = all_means,
         parent_scales = parent_scales,
         min_dist_factor = min_dist_factor,
         k_neighbours = k_neighbours,
-        max_attempts = max_attempts,
+        n_candidates = 32,
+        batch_size = 128,
     )
 
     def param_fn(name: str, p: Tensor) -> Tensor:
@@ -318,7 +499,7 @@ def split_with_poisson(
     state: Dict[str, Tensor],
     mask: Tensor,
     min_dist_factor: float = 1.0,
-    k_neighbours: int = 20,
+    k_neighbours: int = 16,
     max_attempts: int = 30,
     revised_opacity: bool = False,
 ):
@@ -346,14 +527,16 @@ def split_with_poisson(
 
     all_means = params["means"] # necessary for placing poisson points
 
-    child1_means, child2_means = sample_split_positions_with_poisson(
+    #child1_means, child2_means = sample_split_positions_with_poisson(
+    child1_means, child2_means = sample_split_positions_with_poisson_vectorized(
         parent_means = parent_means,
         parent_scales = parent_scales,
         parent_rotmats = parent_rotmats,
         all_means = all_means,
         min_dist_factor = min_dist_factor,
         k_neighbours = k_neighbours,
-        max_attempts = max_attempts,
+        n_candidates = 32,
+        batch_size = 128,
     )
 
     new_means = torch.cat([child1_means, child2_means], dim=0) # combines children
