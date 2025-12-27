@@ -1,5 +1,5 @@
 import numpy as np
-from typing import Callable, Dict, List, Union
+from typing import Callable, Dict, List, Union, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -89,6 +89,197 @@ def _update_param_with_optimizer(
             optimizer.state[new_param] = param_state
 
 
+def sample_duplicate_blue_noise_positions(
+    parent_means: Tensor,  # [N, 3]
+    all_means: Tensor,     # [M, 3] all Gaussian positions
+    parent_scales: Tensor, # [N]
+    min_dist_factor: float = 1.0,
+    k_neighbours: int = 10,
+    max_attempts: int = 30,
+) -> Tensor:
+    device = parent_means.device
+    n = len(parent_means)
+    new_positions = torch.zeros_like(parent_means)
+    
+    for i in range(n):
+        parent_pos = parent_means[i]
+        parent_scale = parent_scales[i]
+        min_dist = min_dist_factor * parent_scale
+        
+        # Find k nearest neighbours to parent
+        dists = torch.norm(all_means - parent_pos, dim=1)
+        (_, neighbour_indices) = torch.topk(dists, k = min(k_neighbours + 1, len(all_means)), largest=False)
+        neighbour_indices = neighbour_indices[1:]  # Exclude self
+        neighbour_positions = all_means[neighbour_indices]
+        
+        # Try to sample a valid position
+        valid_pos = None
+        for attempt in range(max_attempts):
+            # Sample random direction and distance
+            direction = torch.randn(3, device=device)
+            direction = direction / torch.norm(direction)
+            distance = torch.rand(1, device=device) * min_dist * 2  # Up to 2x min_dist
+            
+            candidate = parent_pos + direction * distance
+            
+            # Check if candidate maintains min_dist from neighbours
+            dists_to_neighbours = torch.norm(neighbour_positions - candidate, dim=1)
+            if torch.all(dists_to_neighbours >= min_dist):
+                valid_pos = candidate
+                break
+        
+        # Fallback to parent position if no valid position found
+        if valid_pos is None:
+            new_positions[i] = parent_pos
+            # print("\nNew position could NOT be found\n") # It's only like 3-4 times per iteration it can't find one
+        else:
+            new_positions[i] = valid_pos
+            #print("\nNew position found\n") # Most of the time it finds a new position
+
+    return new_positions
+
+
+def sample_split_positions_with_poisson(
+    parent_means: Tensor,      # [N, 3]
+    parent_scales: Tensor,     # [N, 3]
+    parent_rotmats: Tensor,    # [N, 3, 3]
+    all_means: Tensor,         # [M, 3]
+    min_dist_factor: float = 1.0,
+    k_neighbours: int = 20,
+    max_attempts: int = 30,
+) -> Tuple[Tensor, Tensor]:
+    """
+    Sample positions for 2 children per parent using dart throwing (Poisson disc sampling)
+    
+    Returns:
+        child1_positions: [N, 3]
+        child2_positions: [N, 3]
+    """
+    device = parent_means.device
+    n = len(parent_means)
+    child1_positions = torch.zeros_like(parent_means)
+    child2_positions = torch.zeros_like(parent_means)
+
+    for i in range(n):
+        parent_pos = parent_means[i]
+        parent_scale = parent_scales[i].mean()  # Average scale
+        rotmat = parent_rotmats[i]  # [3, 3]
+        min_dist = min_dist_factor * parent_scale
+        
+        # Find k nearest neighbours to parent
+        dists = torch.norm(all_means - parent_pos, dim=1)
+        (_, neighbour_indices) = torch.topk(dists, k=min(k_neighbours + 1, len(all_means)), largest=False)
+        neighbour_indices = neighbour_indices[1:]  # Exclude self
+        neighbour_positions = all_means[neighbour_indices]
+        
+        # This will sample child 1  before sampling 2
+        # TODO: This can be faster by trying to sample BOTH and accepting when one gets hit
+        # and continuing to sample until the second is hit or max_attempts is hit
+        child1 = None
+        for attempt in range(max_attempts):
+            local_direction = torch.randn(3, device=device)
+            local_direction = local_direction / torch.norm(local_direction)
+            direction = rotmat @ local_direction  # Rotate to world space
+            
+            distance = torch.rand(1, device=device) * min_dist * 1.5
+            candidate1 = parent_pos + direction * distance
+            
+            dists_to_neighbours = torch.norm(neighbour_positions - candidate1, dim=1)
+            if torch.all(dists_to_neighbours >= min_dist):
+                child1 = candidate1
+                break
+        
+        if child1 is None:
+            # Use original split logic as fallback
+            noise = torch.randn(3, device=device)
+            child1 = parent_pos + rotmat @ (parent_scales[i] * noise)
+        
+        child2 = None
+        for attempt in range(max_attempts):
+            # Random direction
+            local_direction = torch.randn(3, device=device)
+            local_direction = local_direction / torch.norm(local_direction)
+            direction = rotmat @ local_direction
+            distance = torch.rand(1, device=device) * min_dist * 1.5
+            
+            candidate2 = parent_pos + direction * distance
+            
+            dists_to_neighbours = torch.norm(neighbour_positions - candidate2, dim=1)
+            dist_to_child1 = torch.norm(child1 - candidate2)
+            
+            if torch.all(dists_to_neighbours >= min_dist) and dist_to_child1 >= min_dist:
+                child2 = candidate2
+                break
+        
+        if child2 is None:
+            # Use original split logic as fallback
+            noise = torch.randn(3, device=device)
+            child2 = parent_pos - rotmat @ (parent_scales[i] * noise)
+        
+        child1_positions[i] = child1
+        child2_positions[i] = child2
+    
+    return child1_positions, child2_positions
+
+
+
+@torch.no_grad()
+def duplicate_with_poisson(
+    params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
+    optimizers: Dict[str, torch.optim.Optimizer],
+    state: Dict[str, Tensor],
+    mask: Tensor,
+    min_dist_factor: float = 1.0,
+    k_neighbours: int = 20,
+    max_attempts: int = 30,
+):
+    """Inplace duplicate the Gaussian with the given mask. Uses poisson disc
+
+    Args:
+        params: A dictionary of parameters.
+        optimizers: A dictionary of optimizers, each corresponding to a parameter.
+        mask: A boolean mask to duplicate the Gaussians.
+    """
+    device = mask.device
+    sel = torch.where(mask)[0]
+    n_duplicates = len(sel)
+    if n_duplicates == 0:
+        return
+    parent_means = params["means"][sel]
+    parent_scales = torch.exp(params["scales"][sel]).mean(dim=-1)
+    all_means = params["means"]
+    new_means = sample_duplicate_blue_noise_positions(
+        parent_means = parent_means,
+        all_means = all_means,
+        parent_scales = parent_scales,
+        min_dist_factor = min_dist_factor,
+        k_neighbours = k_neighbours,
+        max_attempts = max_attempts,
+    )
+
+    def param_fn(name: str, p: Tensor) -> Tensor:
+        if name == "means":
+            return torch.nn.Parameter(
+                torch.cat([p, new_means]), 
+                requires_grad=p.requires_grad
+            )
+        else:
+            return torch.nn.Parameter(
+                torch.cat([p, p[sel]]), 
+                requires_grad=p.requires_grad
+            )
+    
+    def optimizer_fn(key: str, v: Tensor) -> Tensor:
+        return torch.cat([v, torch.zeros((n_duplicates, *v.shape[1:]), device=device)])
+    
+    _update_param_with_optimizer(param_fn, optimizer_fn, params, optimizers)
+    
+    for k, v in state.items():
+        if isinstance(v, torch.Tensor):
+            state[k] = torch.cat((v, v[sel]))
+
+
+
 @torch.no_grad()
 def duplicate(
     params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
@@ -121,6 +312,89 @@ def duplicate(
 
 
 @torch.no_grad()
+def split_with_poisson(
+    params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
+    optimizers: Dict[str, torch.optim.Optimizer],
+    state: Dict[str, Tensor],
+    mask: Tensor,
+    min_dist_factor: float = 1.0,
+    k_neighbours: int = 20,
+    max_attempts: int = 30,
+    revised_opacity: bool = False,
+):
+    """
+    Inplace split Gaussians with blue noise spacing.
+    
+    Args:
+        params: A dictionary of parameters.
+        optimizers: A dictionary of optimizers.
+        state: Extra running state.
+        mask: Boolean mask indicating which Gaussians to split.
+        min_dist_factor: Multiplier for minimum distance (relative to parent scale).
+        k_neighbours: Number of neighbors to consider for spacing.
+        max_attempts: Maximum sampling attempts per child.
+        revised_opacity: Whether to use revised opacity formulation.
+    """
+    device = mask.device
+    sel = torch.where(mask)[0] # indicies of gaussians to split
+    rest = torch.where(~mask)[0] # indicies of gaussians not to split
+
+    parent_means = params["means"][sel]  # [N, 3]
+    parent_scales = torch.exp(params["scales"][sel])  # [N, 3]
+    parent_quats = F.normalize(params["quats"][sel], dim=-1)  # [N, 4]
+    parent_rotmats = normalized_quat_to_rotmat(parent_quats)  # [N, 3, 3]
+
+    all_means = params["means"] # necessary for placing poisson points
+
+    child1_means, child2_means = sample_split_positions_with_poisson(
+        parent_means = parent_means,
+        parent_scales = parent_scales,
+        parent_rotmats = parent_rotmats,
+        all_means = all_means,
+        min_dist_factor = min_dist_factor,
+        k_neighbours = k_neighbours,
+        max_attempts = max_attempts,
+    )
+
+    new_means = torch.cat([child1_means, child2_means], dim=0) # combines children
+    
+    def param_fn(name: str, p: Tensor) -> Tensor:
+        repeats = [2] + [1] * (p.dim() - 1)
+        
+        if name == "means":
+            # Use blue noise sampled positions
+            p_split = new_means  # [2N, 3]
+        elif name == "scales":
+            # Smaller scales, repeated for both children
+            p_split = torch.log(parent_scales / 1.6).repeat(repeats)  # [2N, 3]
+        elif name == "opacities" and revised_opacity:
+            new_opacities = 1.0 - torch.sqrt(1.0 - torch.sigmoid(p[sel]))
+            p_split = torch.logit(new_opacities).repeat(repeats)  # [2N]
+        else:
+            # Other parameters (quats, colors) - duplicate from parent
+            p_split = p[sel].repeat(repeats)
+        
+        p_new = torch.cat([p[rest], p_split])
+        return torch.nn.Parameter(p_new, requires_grad=p.requires_grad)
+    
+    def optimizer_fn(key: str, v: Tensor) -> Tensor:
+        v_split = torch.zeros((2 * len(sel), *v.shape[1:]), device=device)
+        return torch.cat([v[rest], v_split])
+    
+    # Update parameters and optimizers
+    _update_param_with_optimizer(param_fn, optimizer_fn, params, optimizers)
+    
+    # Update extra running state
+    for k, v in state.items():
+        if isinstance(v, torch.Tensor):
+            repeats = [2] + [1] * (v.dim() - 1)
+            v_new = v[sel].repeat(repeats)
+            state[k] = torch.cat((v[rest], v_new))
+
+
+    return
+
+@torch.no_grad()
 def split(
     params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
     optimizers: Dict[str, torch.optim.Optimizer],
@@ -138,8 +412,8 @@ def split(
           from arXiv:2404.06109. Default: False.
     """
     device = mask.device
-    sel = torch.where(mask)[0]
-    rest = torch.where(~mask)[0]
+    sel = torch.where(mask)[0] # indicies of gaussians to split
+    rest = torch.where(~mask)[0] # indicies of gaussians not to split
 
     scales = torch.exp(params["scales"][sel])
     quats = F.normalize(params["quats"][sel], dim=-1)

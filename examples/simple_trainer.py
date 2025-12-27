@@ -35,7 +35,7 @@ from gsplat.compression import PngCompression
 from gsplat.distributed import cli
 from gsplat.optimizers import SelectiveAdam
 from gsplat.rendering import rasterization
-from gsplat.strategy import DefaultStrategy, MCMCStrategy
+from gsplat.strategy import DefaultStrategy, MCMCStrategy, PoissonDiscStrategy
 from gsplat_viewer import GsplatViewer, GsplatRenderTabState
 from nerfview import CameraState, RenderTabState, apply_float_colormap
 
@@ -112,7 +112,7 @@ class Config:
     far_plane: float = 1e10
 
     # Strategy for GS densification
-    strategy: Union[DefaultStrategy, MCMCStrategy] = field(
+    strategy: Union[DefaultStrategy, MCMCStrategy, PoissonDiscStrategy] = field(
         default_factory=DefaultStrategy
     )
     # Use packed mode for rasterization, this leads to less memory usage but slightly slower.
@@ -203,6 +203,11 @@ class Config:
         elif isinstance(strategy, MCMCStrategy):
             strategy.refine_start_iter = int(strategy.refine_start_iter * factor)
             strategy.refine_stop_iter = int(strategy.refine_stop_iter * factor)
+            strategy.refine_every = int(strategy.refine_every * factor)
+        elif isinstance(strategy, PoissonDiscStrategy):
+            strategy.refine_start_iter = int(strategy.refine_start_iter * factor)
+            strategy.refine_stop_iter = int(strategy.refine_stop_iter * factor)
+            strategy.reset_every = int(strategy.reset_every * factor)
             strategy.refine_every = int(strategy.refine_every * factor)
         else:
             assert_never(strategy)
@@ -384,6 +389,10 @@ class Runner:
             )
         elif isinstance(self.cfg.strategy, MCMCStrategy):
             self.strategy_state = self.cfg.strategy.initialize_state()
+        elif isinstance(self.cfg.strategy, PoissonDiscStrategy):
+            self.strategy_state = self.cfg.strategy.initialize_state(
+                scene_scale=self.scene_scale
+            )
         else:
             assert_never(self.cfg.strategy)
 
@@ -528,7 +537,7 @@ class Runner:
             packed=self.cfg.packed,
             absgrad=(
                 self.cfg.strategy.absgrad
-                if isinstance(self.cfg.strategy, DefaultStrategy)
+                if isinstance(self.cfg.strategy, DefaultStrategy) or isinstance(self.cfg.strategy, PoissonDiscStrategy)
                 else False
             ),
             sparse_grad=self.cfg.sparse_grad,
@@ -878,6 +887,15 @@ class Runner:
                     info=info,
                     lr=schedulers[0].get_last_lr()[0],
                 )
+            elif isinstance(self.cfg.strategy, PoissonDiscStrategy):
+                self.cfg.strategy.step_post_backward(
+                    params=self.splats,
+                    optimizers=self.optimizers,
+                    state=self.strategy_state,
+                    step=step,
+                    info=info,
+                    packed=cfg.packed,
+                )
             else:
                 assert_never(self.cfg.strategy)
 
@@ -1219,6 +1237,12 @@ if __name__ == "__main__":
                 opacity_reg=0.01,
                 scale_reg=0.01,
                 strategy=MCMCStrategy(verbose=True),
+            ),
+        ),
+        "poisson_disc": (
+            "Gaussian splatting training using a poisson-disc distribution for densification.",
+            Config(
+                strategy = PoissonDiscStrategy(verbose = True),
             ),
         ),
     }
