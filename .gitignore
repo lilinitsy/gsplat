@@ -125,3 +125,4 @@ data
 results
 
 !examples/benchmarks/compression/results/
+examples/instrumentation/*.md
